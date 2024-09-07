@@ -10,13 +10,6 @@ from PIL import Image, ImageTk, ImageOps
 import json
 from imutils import face_utils
 
-# Check for Pillow's Resampling module or fallback to older LANCZOS constant
-try:
-    from PIL import Resampling
-    LANCZOS = Resampling.LANCZOS
-except ImportError:
-    LANCZOS = Image.LANCZOS  # Fallback for older Pillow versions
-
 # Initialize Dlib's face detector and predictor
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
@@ -46,27 +39,12 @@ def load_eye_positions():
 # Helper function to save eye positions to JSON
 def save_eye_positions(eye_positions):
     with open(EYE_POSITIONS_FILE, 'w') as file:
-        json.dump(eye_positions, file)
+        serializable_eye_positions = {
+            filename: [[int(pupil[0]), int(pupil[1])] for pupil in pupils]
+            for filename, pupils in eye_positions.items()
+        }
+        json.dump(serializable_eye_positions, file)
 
-# Attempt to load the image using OpenCV, fallback to PIL if needed
-def load_image_cv_or_pil(file_path):
-    try:
-        # Try loading the image using OpenCV
-        img = cv2.imread(file_path)
-        if img is None:
-            raise ValueError(f"OpenCV failed to load image: {file_path}")
-        return img
-    except Exception as e:
-        print(f"OpenCV failed with error: {e}. Attempting to load with PIL.")
-        # Fallback to loading with PIL
-        try:
-            pil_image = Image.open(file_path)
-            pil_image = ImageOps.exif_transpose(pil_image)  # Handle any EXIF orientation issues
-            img = np.array(pil_image)
-            return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Convert back to BGR format for OpenCV compatibility
-        except Exception as pil_error:
-            print(f"PIL also failed to load image: {file_path}. Error: {pil_error}")
-            return None
 
 # Load all images from a folder and sort by modified date
 def load_images(folder):
@@ -74,130 +52,78 @@ def load_images(folder):
     for filename in os.listdir(folder):
         if filename.endswith((".jpg", ".png", ".jpeg")):
             file_path = os.path.join(folder, filename)
-            img = load_image_cv_or_pil(file_path)  # Use the updated loader with OpenCV fallback to PIL
+            img = cv2.imread(file_path)
             if img is not None:
-                # Get the modification time of the file
                 mod_time = os.path.getmtime(file_path)
                 images.append((filename, img, mod_time))
             else:
                 print(f"Skipping file {filename} due to loading error.")
-    # Sort images by modification date (mod_time)
-    images.sort(key=lambda x: x[2])  # Sort by modification time
+    images.sort(key=lambda x: x[2])
     return images
 
-# Detect landmarks for the eyes, choosing the largest face
-def detect_eyes_largest_face(image):
+# Detect pupils in the largest face
+def detect_pupils_with_preprocessing(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     faces = detector(gray, 1)
-    
+
     if len(faces) == 0:
-        return None
-    
-    # Select the largest face by area (width * height of the bounding box)
+        return (0, 0), (0, 0)
+
     largest_face = max(faces, key=lambda rect: rect.width() * rect.height())
-    
-    # Get landmarks for the largest face
     landmarks = predictor(gray, largest_face)
-    return face_utils.shape_to_np(landmarks)
+    landmarks = face_utils.shape_to_np(landmarks)
 
-def refine_eye_landmarks(image, pupil_center, box_size=150):
-    """
-    Refine the eye landmarks by detecting the eye in a significantly larger region around the manually clicked pupil.
-    
-    Parameters:
-    - image: the original image (in BGR format).
-    - pupil_center: the (x, y) coordinates of the manually clicked pupil center.
-    - box_size: the size of the region to crop around the pupil center for detection.
-    
-    Returns:
-    - A NumPy array with six points for the eye if detection is successful, otherwise None.
-    """
-    # Define the region of interest (ROI) around the pupil center
-    x, y = pupil_center
-    half_box = box_size // 2
-    x1, y1 = max(0, x - half_box), max(0, y - half_box)
-    x2, y2 = min(image.shape[1], x + half_box), min(image.shape[0], y + half_box)
-    
-    # Crop the region around the pupil
-    roi = image[y1:y2, x1:x2]
-    
-    # Convert the region to grayscale for detection
-    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    
-    # Detect the face landmarks in the cropped region
-    faces = detector(gray_roi, 1)
-    if len(faces) > 0:
-        # Get the largest face (usually the only face in the cropped region)
-        largest_face = faces[0]
-        
-        # Detect landmarks
-        landmarks = predictor(gray_roi, largest_face)
-        landmarks = face_utils.shape_to_np(landmarks)
-        
-        # Extract the eye landmarks from the cropped region
-        left_eye_landmarks = landmarks[36:42]
-        
-        # Adjust the positions of the eye landmarks relative to the original image
-        left_eye_landmarks[:, 0] += x1
-        left_eye_landmarks[:, 1] += y1
-        
-        return left_eye_landmarks
-    else:
-        print(f"Warning: Could not detect eye in the region around {pupil_center}.")
-        return None
+    # Extract the eye landmarks
+    left_eye_landmarks = landmarks[36:42]
+    right_eye_landmarks = landmarks[42:48]
 
-# Load the OpenCV Haar Cascade for eye detection
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+    # Extract and preprocess eye regions
+    left_eye_region = extract_eye_region(gray, left_eye_landmarks)
+    right_eye_region = extract_eye_region(gray, right_eye_landmarks)
 
-def refine_eye_with_haar(image, pupil_center, box_size=150):
-    """
-    Refine the eye landmarks using OpenCV's Haar Cascade for eye detection in a larger region around the manually clicked pupil.
-    
-    Parameters:
-    - image: the original image (in BGR format).
-    - pupil_center: the (x, y) coordinates of the manually clicked pupil center.
-    - box_size: the size of the region to crop around the pupil center for detection.
-    
-    Returns:
-    - A NumPy array with six points for the eye approximated from the bounding box.
-    """
-    # Define the region of interest (ROI) around the pupil center
-    x, y = pupil_center
-    half_box = box_size // 2
-    x1, y1 = max(0, x - half_box), max(0, y - half_box)
-    x2, y2 = min(image.shape[1], x + half_box), min(image.shape[0], y + half_box)
-    
-    # Crop the region around the pupil
-    roi = image[y1:y2, x1:x2]
-    
-    # Convert the region to grayscale for detection
-    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    
-    # Detect eyes using OpenCV's Haar Cascade
-    eyes = eye_cascade.detectMultiScale(gray_roi)
-    
-    if len(eyes) > 0:
-        # Get the first detected eye
-        (ex, ey, ew, eh) = eyes[0]
-        
-        # Adjust the eye position to the original image coordinates
-        ex += x1
-        ey += y1
-        
-        # Approximate six landmarks from the bounding box
-        eye_landmarks = np.array([
-            [ex, ey + eh // 2],  # Left corner (middle)
-            [ex + ew // 2, ey],  # Top center
-            [ex + ew, ey + eh // 2],  # Right corner (middle)
-            [ex + ew // 2, ey + eh],  # Bottom center
-            [ex + ew // 4, ey + eh // 4],  # Top-left
-            [ex + 3 * ew // 4, ey + eh // 4]  # Top-right
-        ])
-        
-        return eye_landmarks
-    else:
-        print(f"Warning: Could not detect eye in the region around {pupil_center} using Haar Cascade.")
-        return None
+    left_eye_region = preprocess_eye(left_eye_region)
+    right_eye_region = preprocess_eye(right_eye_region)
+
+    # Detect pupils
+    left_pupil = detect_pupil_in_eye(left_eye_region)
+    right_pupil = detect_pupil_in_eye(right_eye_region)
+
+    # Convert to global coordinates
+    left_pupil_global = convert_to_global_coords(left_pupil, left_eye_landmarks)
+    right_pupil_global = convert_to_global_coords(right_pupil, right_eye_landmarks)
+
+    return left_pupil_global, right_pupil_global
+
+def extract_eye_region(gray_image, eye_landmarks):
+    x_min = min(eye_landmarks[:, 0])
+    x_max = max(eye_landmarks[:, 0])
+    y_min = min(eye_landmarks[:, 1])
+    y_max = max(eye_landmarks[:, 1])
+    return gray_image[y_min:y_max, x_min:x_max]
+
+def preprocess_eye(eye_region):
+    eye_preprocessed = cv2.equalizeHist(eye_region)
+    return eye_preprocessed
+
+def detect_pupil_in_eye(eye_region):
+    _, thresh = cv2.threshold(eye_region, 30, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        return (0, 0)
+    largest_contour = max(contours, key=cv2.contourArea)
+    M = cv2.moments(largest_contour)
+    if M['m00'] == 0:
+        return (0, 0)
+    cx = int(M['m10'] / M['m00'])
+    cy = int(M['m01'] / M['m00'])
+    return (cx, cy)
+
+def convert_to_global_coords(pupil_position, eye_landmarks):
+    x_min = min(eye_landmarks[:, 0])
+    y_min = min(eye_landmarks[:, 1])
+    global_x = pupil_position[0] + x_min
+    global_y = pupil_position[1] + y_min
+    return (global_x, global_y)
 
 # GUI Application for reviewing and correcting eye detection
 class EyeReviewApp:
@@ -210,21 +136,25 @@ class EyeReviewApp:
         if 'window_size' in config:
             self.master.geometry(config['window_size'])
 
-        # Get the current script directory and set it as the initial directory for the file dialog
-        script_dir = os.path.dirname(os.path.realpath(__file__))
-        initial_dir = os.path.join(script_dir, "subfolder")  # Change 'subfolder' to your image subfolder
+        # Load previously selected folder from config
+        config = load_config()
+        self.folder_path = config.get('last_folder', None)
 
-        self.folder_path = filedialog.askdirectory(initialdir=initial_dir, title="Select Folder with Images")
-        if not self.folder_path:
-            messagebox.showerror("Error", "No folder selected!")
-            self.master.quit()
+        if not self.folder_path or not os.path.exists(self.folder_path):
+            # Ask for folder if none saved or folder doesn't exist
+            self.folder_path = filedialog.askdirectory(title="Select Folder with Images")
+            if not self.folder_path:
+                messagebox.showerror("Error", "No folder selected!")
+                self.master.quit()
 
+        # Load images and eye positions
         self.images = load_images(self.folder_path)
-        self.eye_positions = load_eye_positions()  # Load saved eye positions
-        self.detection_results = [None] * len(self.images)  # Initially None, indicating not processed yet
-        self.manual_corrections = [False] * len(self.images)  # Track whether manual correction was applied
+        self.eye_positions = load_eye_positions()
+
+        self.detection_results = [None] * len(self.images)
+        self.manual_corrections = [False] * len(self.images)
         self.current_image_index = None
-        self.clicks = []  # Store manual eye selection clicks
+        self.clicks = []
 
         # Left pane - Listbox for image list with detection status
         self.listbox_frame = tk.Frame(master)
@@ -240,12 +170,12 @@ class EyeReviewApp:
 
         self.canvas = tk.Canvas(self.canvas_frame, width=600, height=600)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Button-1>", self.on_canvas_click)  # Bind mouse click for manual eye selection
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
 
-        # Populate listbox with file names (without waiting for eye detection)
+        # Populate listbox with file names
         self.populate_listbox()
 
-        # Start background processing for eye detection
+        # Start background processing for pupil detection
         threading.Thread(target=self.process_images_in_background, daemon=True).start()
 
         # Save window size and position on close
@@ -253,39 +183,28 @@ class EyeReviewApp:
 
     # Populate the listbox with file names (initially without detection status)
     def populate_listbox(self):
-        for filename, _, mod_time in self.images:
-            if filename in self.eye_positions:  # Use saved eye positions if available
-                self.listbox.insert(tk.END, f"{filename} ⚙️")  # Mark as manually corrected
-                # Convert the eye positions from the JSON format back to NumPy arrays
-                left_eye, right_eye = self.eye_positions[filename]
-                left_eye = np.array(left_eye)
-                right_eye = np.array(right_eye)
-                self.detection_results[self.images.index((filename, _, mod_time))] = np.concatenate((left_eye, right_eye), axis=0)
-                print(f"Loaded eye positions for {filename}: {left_eye}, {right_eye}")  # Debug statement
+        for filename, _, _ in self.images:
+            if filename in self.eye_positions:
+                self.listbox.insert(tk.END, f"{filename} ⚙️")
             else:
-                self.listbox.insert(tk.END, f"{filename} ⏳")  # ⏳ indicates waiting for detection
+                self.listbox.insert(tk.END, f"{filename} ⏳")
 
-    # Background thread to process images for eye detection
+    # Background thread to process images for pupil detection
     def process_images_in_background(self):
         for idx, (filename, image, _) in enumerate(self.images):
-            if filename not in self.eye_positions:  # Skip already processed images
-                landmarks = detect_eyes_largest_face(image)  # Get eyes from the largest face
-                if landmarks is not None:
-                    self.detection_results[idx] = landmarks  # Store landmarks
-                    
-                    # Save the detected landmarks to the eye_positions JSON file immediately
-                    self.eye_positions[filename] = [landmarks[36:42].tolist(), landmarks[42:48].tolist()]  # Left and right eye landmarks
+            if filename not in self.eye_positions:
+                left_pupil, right_pupil = detect_pupils_with_preprocessing(image)
+                
+                if left_pupil != (0, 0) and right_pupil != (0, 0):
+                    self.eye_positions[filename] = [left_pupil, right_pupil]
                     save_eye_positions(self.eye_positions)
-                    print(f"Detected eye positions for {filename}: {landmarks[36:42]}, {landmarks[42:48]}")  # Debug statement
-                    
-                    self.update_listbox_item(idx, filename, True)  # Update to show success ✅
+                    self.update_listbox_item(idx, filename, True)
                 else:
-                    self.detection_results[idx] = False  # Indicate failure
-                    self.update_listbox_item(idx, filename, False)  # Update to show failure ❌
+                    self.update_listbox_item(idx, filename, False)
 
-    # Update a specific item in the listbox (success or failure, with manual correction option)
-    def update_listbox_item(self, index, filename, success, manual=False):
-        status_icon = "⚙️" if manual else ("✅" if success else "❌")
+    # Update a specific item in the listbox (success or failure)
+    def update_listbox_item(self, index, filename, success):
+        status_icon = "✅" if success else "❌"
         new_text = f"{filename} {status_icon}"
         self.listbox.delete(index)
         self.listbox.insert(index, new_text)
@@ -299,17 +218,13 @@ class EyeReviewApp:
         index = selection[0]
         self.current_image_index = index
         filename, image, _ = self.images[index]
-        detection_status = self.detection_results[index]
+        pupil_positions = self.eye_positions.get(filename, None)
 
-        # Resize and display the image on the canvas
-        self.display_image(image, detection_status)
+        self.display_image(image, pupil_positions)
 
-    # Update the display_image function to use the refined eye detection if manually selected
-    def display_image(self, image, detection_status):
-        # Get the original image dimensions
+    # Display image on canvas and draw pupils
+    def display_image(self, image, pupil_positions):
         original_height, original_width = image.shape[:2]
-
-        # Convert image for displaying on Canvas
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
         resized_pil_image, scale_factor_w, scale_factor_h = self.resize_image(pil_image, self.canvas.winfo_width(), self.canvas.winfo_height())
@@ -317,113 +232,57 @@ class EyeReviewApp:
 
         # Clear previous drawings
         self.canvas.delete("all")
-
-        # Display the image
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.current_image)
 
-        # Debugging statement to ensure we're calling the correct function
-        print(f"Displaying image with detection status: {detection_status}")
+        if pupil_positions:
+            left_pupil, right_pupil = pupil_positions
+            left_pupil_scaled = (int(left_pupil[0] * scale_factor_w), int(left_pupil[1] * scale_factor_h))
+            right_pupil_scaled = (int(right_pupil[0] * scale_factor_w), int(right_pupil[1] * scale_factor_h))
 
-        if isinstance(detection_status, np.ndarray):
-            # Check if we have six key points (auto-detected) or just two key points (manually corrected)
-            if detection_status.shape[0] == 12:  # 12 key points = 6 per eye (auto-detected)
-                left_eye = detection_status[:6]  # First six points are for the left eye
-                right_eye = detection_status[6:]  # Last six points are for the right eye
-            elif detection_status.shape[0] == 2:  # 2 key points = manually corrected (pupil centers)
-                # Try Haar cascade to refine the eye landmarks based on pupil centers
-                left_eye = refine_eye_with_haar(image, detection_status[0])
-                right_eye = refine_eye_with_haar(image, detection_status[1])
-                
-                # If we couldn't detect the landmarks, default back to the clicked centers
-                if left_eye is None:
-                    left_eye = np.array([detection_status[0]])
-                if right_eye is None:
-                    right_eye = np.array([detection_status[1]])
-            else:
-                print("Invalid eye position format.")
-                return
-
-            # Debugging eye positions
-            print(f"Rendering eyes at positions: left_eye={left_eye}, right_eye={right_eye}")
-
-            # Check if eyes are valid (non-empty)
-            if len(left_eye) > 0 and len(right_eye) > 0:
-                # Scale the landmark positions based on the resize factors
-                left_eye_center = (left_eye.mean(axis=0) * [scale_factor_w, scale_factor_h]).astype("int")
-                right_eye_center = (right_eye.mean(axis=0) * [scale_factor_w, scale_factor_h]).astype("int")
-
-                # Debugging the scaled positions
-                print(f"Scaled eye positions: left_eye_center={left_eye_center}, right_eye_center={right_eye_center}")
-
-                # Draw circles on the eyes
-                for point in left_eye:
-                    point = (point * [scale_factor_w, scale_factor_h]).astype("int")
-                    self.canvas.create_oval(point[0] - 2, point[1] - 2, point[0] + 2, point[1] + 2, outline="yellow", width=2)
-
-                for point in right_eye:
-                    point = (point * [scale_factor_w, scale_factor_h]).astype("int")
-                    self.canvas.create_oval(point[0] - 2, point[1] - 2, point[0] + 2, point[1] + 2, outline="yellow", width=2)
-            else:
-                print("Eye positions are empty. Not rendering circles.")
-        else:
-            print("Invalid detection status, not rendering eyes.")
+            self.canvas.create_oval(left_pupil_scaled[0] - 2, left_pupil_scaled[1] - 2,
+                                    left_pupil_scaled[0] + 2, left_pupil_scaled[1] + 2,
+                                    outline="yellow", width=2)
+            self.canvas.create_oval(right_pupil_scaled[0] - 2, right_pupil_scaled[1] - 2,
+                                    right_pupil_scaled[0] + 2, right_pupil_scaled[1] + 2,
+                                    outline="yellow", width=2)
 
     # Resize image to fit the canvas while keeping the aspect ratio
     def resize_image(self, image, canvas_width, canvas_height):
         image_width, image_height = image.size
         ratio = min(canvas_width / image_width, canvas_height / image_height)
         new_size = (int(image_width * ratio), int(image_height * ratio))
-        resized_image = image.resize(new_size, LANCZOS)  # Use the correct LANCZOS based on version
-        return resized_image, ratio, ratio  # Return scale factors for width and height
+        resized_image = image.resize(new_size, Image.LANCZOS)
+        return resized_image, ratio, ratio
 
     # Handle mouse click on canvas for manual eye selection
     def on_canvas_click(self, event):
         if self.current_image_index is None:
             return
 
-        # Record the click coordinates and scale them back to the original image size
         clicked_x = event.x
         clicked_y = event.y
-
-        # Get the scaling factors from the current displayed image
         _, scale_factor_w, scale_factor_h = self.resize_image(Image.fromarray(self.images[self.current_image_index][1]),
                                                               self.canvas.winfo_width(), self.canvas.winfo_height())
 
         original_x = int(clicked_x / scale_factor_w)
         original_y = int(clicked_y / scale_factor_h)
-
-        # Store the click for manual selection
         self.clicks.append((original_x, original_y))
 
-        # Once two points (left and right eye) are selected, update the image and mark as manually corrected
         if len(self.clicks) == 2:
-            # Overwrite the detection result with manual selection
-            left_eye, right_eye = self.clicks
-            self.detection_results[self.current_image_index] = np.array([left_eye, right_eye])
-
-            # Display the updated image with eye circles immediately
-            self.display_image(self.images[self.current_image_index][1], self.detection_results[self.current_image_index])
-
-            # Clear the clicks for future use
+            left_pupil, right_pupil = self.clicks
+            self.eye_positions[self.images[self.current_image_index][0]] = [left_pupil, right_pupil]
+            self.display_image(self.images[self.current_image_index][1], self.eye_positions[self.images[self.current_image_index][0]])
+            save_eye_positions(self.eye_positions)
+            self.update_listbox_item(self.current_image_index, self.images[self.current_image_index][0], True)
             self.clicks = []
 
-            # Save the manually corrected eye positions
-            filename, _, _ = self.images[self.current_image_index]
-            self.eye_positions[filename] = [list(left_eye), list(right_eye)]  # Fixed: using list() instead of tolist()
-            save_eye_positions(self.eye_positions)
-
-            # Update the listbox to indicate manual correction
-            self.update_listbox_item(self.current_image_index, filename, True, manual=True)
-
-    # Handle window close to save size and position
+    # Handle window close to save size, position, and last folder
     def on_close(self):
-        # Save window size and position
         window_geometry = self.master.geometry()
         config = load_config()
         config['window_size'] = window_geometry
+        config['last_folder'] = self.folder_path
         save_config(config)
-
-        # Exit the application
         self.master.destroy()
 
 # Run the application
